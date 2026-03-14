@@ -1,0 +1,1084 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VRM Viewer - texatan.vrm</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three.module.js",
+          "three/addons/": "./vendor/three/addons/",
+          "@pixiv/three-vrm": "./vendor/three-vrm.module.min.js",
+          "@pixiv/three-vrm-animation": "./vendor/three-vrm-animation.module.js"
+        }
+      }
+    </script>
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: #f3f4f6;
+        color: #111827;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+      canvas {
+        display: block;
+      }
+      .hud {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.85);
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        border-radius: 10px;
+        font-size: 13px;
+        line-height: 1.35;
+        max-width: 320px;
+        backdrop-filter: blur(6px);
+      }
+      .hud code {
+        font-family: Consolas, "Courier New", monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div class="hud">
+      Drag to orbit. Scroll to zoom. Use the controls panel (top-right) to rotate
+      and set expressions.
+      <br />
+      If the model doesn’t load, run a local server and open
+      <code>http://localhost:8000</code>.
+    </div>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+      import { VRM, VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
+      import {
+        VRMAnimationLoaderPlugin,
+        createVRMAnimationClip,
+      } from "@pixiv/three-vrm-animation";
+      import { createProceduralIdle } from "./procedural_idle.js";
+      import { createProceduralSpeaking } from "./procedural_speaking.js";
+      import { createProceduralHipSway } from "./procedural_hip_sway.js";
+      import GUI from "./vendor/lil-gui/lil-gui.esm.js";
+      import {
+        PoseLandmarker,
+        FilesetResolver,
+      } from "./vendor/mediapipe/vision_bundle.min.mjs";
+
+      const container = document.getElementById("app");
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      const RENDER_SCALE = 0.75;
+      renderer.setPixelRatio(window.devicePixelRatio * RENDER_SCALE);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      container.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x000000);
+
+      const camera = new THREE.PerspectiveCamera(
+        35,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        100
+      );
+      camera.position.set(0, 1.4, 2.6);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 1.2, 0);
+      controls.enableDamping = true;
+
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x111111, 0.9);
+      hemi.position.set(0, 2, 0);
+      scene.add(hemi);
+
+      const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+      dir.position.set(1.2, 2.0, 1.0);
+      scene.add(dir);
+
+      const grid = new THREE.GridHelper(10, 10, 0x1f2937, 0x111827);
+      grid.position.y = 0;
+      scene.add(grid);
+
+      const loader = new GLTFLoader();
+      loader.register((parser) => new VRMLoaderPlugin(parser));
+      loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
+
+      let currentVrm = null;
+      let currentMixer = null;
+      let currentAction = null;
+      let pendingVrmAnimation = null;
+      let lastRetargetStats = null;
+      const basePose = new Map();
+      const proceduralIdle = createProceduralIdle(THREE);
+      const proceduralSpeaking = createProceduralSpeaking(THREE);
+      const proceduralHipSway = createProceduralHipSway(THREE);
+      let nextBlinkTime = 0;
+      let blinkPhase = 0;
+      let gazeTarget = 0;
+      let gazeCurrent = 0;
+      let nextGazeTime = 0;
+      const PROCEDURAL_BONES = [
+        "hips",
+        "spine",
+        "chest",
+        "upperChest",
+        "neck",
+        "head",
+        "leftUpperArm",
+        "leftLowerArm",
+        "leftHand",
+        "rightUpperArm",
+        "rightLowerArm",
+        "rightHand",
+        "leftUpperLeg",
+        "leftLowerLeg",
+        "leftFoot",
+        "rightUpperLeg",
+        "rightLowerLeg",
+        "rightFoot",
+      ];
+      const clock = new THREE.Clock();
+
+      const state = {
+        rotateX: 0,
+        rotateY: 0,
+        rotateZ: 0,
+        lookAtCamera: true,
+        blink: 0,
+        joy: 0,
+        angry: 0,
+        sorrow: 0,
+        fun: 0,
+        blinkLeft: 0,
+        blinkRight: 0,
+        lookUp: 0,
+        lookDown: 0,
+        lookLeft: 0,
+        lookRight: 0,
+        autoBlink: true,
+        blinkRate: 0.18,
+        blinkSpeed: 14,
+        gazeShift: true,
+        gazeShiftRate: 0.08,
+        gazeShiftAmount: 0.35,
+        speakingEnabled: false,
+        speakingRate: 1.4,
+        speakingIntensity: 0.9,
+        speakingMouthOpen: 0.2,
+        speakingSmile: 0.25,
+        speakingArmGesture: 0.35,
+        speakingArmSpeed: 1.2,
+        aa: 0,
+        ih: 0,
+        ou: 0,
+        ee: 0,
+        oh: 0,
+        headFollow: true,
+        headFollowStrength: 0.35,
+        headFollowMaxYaw: 30,
+        headFollowMaxPitch: 20,
+        trackingEnabled: true,
+        trackingStrength: 0.9,
+        poseSmoothing: 0.35,
+        mirrorVideo: true,
+        animationEnabled: true,
+        animationSpeed: 1.0,
+        retargetMixamo: true,
+        retargetTranslationScale: 0.01,
+        retargetHipsOnlyPosition: true,
+        retargetUseSourceRest: true,
+        proceduralEnabled: true,
+        proceduralIntensity: 0.9,
+        proceduralSpeed: 1.2,
+        proceduralArmRelax: 0.3,
+        proceduralArmForward: -0.17,
+        proceduralArmDown: 0.79,
+        proceduralElbowBend: 0.0,
+        proceduralBurstRate: 0.35,
+        proceduralIdleBias: 0.6,
+        proceduralFootLock: true,
+        springEnabled: true,
+        springStiffness: 18,
+        springDamping: 6,
+        proceduralHeadTilt: 1.0,
+        proceduralWeightShift: 1.0,
+        hipSwayEnabled: false,
+        hipSwayIntensity: 0.6,
+        hipSwaySpeed: 1.0,
+      };
+
+      const EXPRESSION_KEYS = [
+        "blink",
+        "blinkLeft",
+        "blinkRight",
+        "joy",
+        "angry",
+        "sorrow",
+        "fun",
+        "lookUp",
+        "lookDown",
+        "lookLeft",
+        "lookRight",
+        "aa",
+        "ih",
+        "ou",
+        "ee",
+        "oh",
+      ];
+
+      const EXPRESSION_ALIASES = {
+        joy: "happy",
+        sorrow: "sad",
+        fun: "relaxed",
+      };
+
+      function setExpressionValue(em, key, value) {
+        if (!em) return;
+        if (em.getExpression?.(key)) {
+          em.setValue(key, value);
+          return;
+        }
+        const alias = EXPRESSION_ALIASES[key];
+        if (alias && em.getExpression?.(alias)) {
+          em.setValue(alias, value);
+        }
+      }
+
+      async function loadVrm(url) {
+        const gltf = await loader.loadAsync(url);
+        const vrm = gltf.userData.vrm;
+
+        VRMUtils.removeUnnecessaryVertices(vrm.scene);
+        VRMUtils.combineSkeletons(vrm.scene);
+
+        if (currentVrm) {
+          scene.remove(currentVrm.scene);
+          VRMUtils.deepDispose(currentVrm.scene);
+        }
+
+        currentVrm = vrm;
+        currentVrm.scene.position.set(0, 0, 0);
+        scene.add(currentVrm.scene);
+        resetExpressions();
+        syncLookAt();
+        syncRotation();
+        captureBasePose();
+        nextBlinkTime = 0;
+        blinkPhase = 0;
+        gazeTarget = 0;
+        gazeCurrent = 0;
+        nextGazeTime = 0;
+        if (pendingVrmAnimation) {
+          applyVrmAnimation(pendingVrmAnimation);
+        }
+      }
+
+      proceduralIdle.setContext({ state, basePose, getBoneNode });
+      proceduralSpeaking.setContext({ state, basePose, getBoneNode });
+      proceduralHipSway.setContext({ state, basePose, getBoneNode });
+
+      await loadVrm("./texatan.vrm");
+
+      // --- Video + Pose Tracking ---
+      const video = document.createElement("video");
+      video.setAttribute("playsinline", "");
+      video.muted = true;
+      video.style.display = "none";
+      document.body.appendChild(video);
+      let webcamStream = null;
+
+      const videoCanvas = document.createElement("canvas");
+      videoCanvas.width = 480;
+      videoCanvas.height = 270;
+      const videoCtx = videoCanvas.getContext("2d");
+
+      let poseLandmarker = null;
+      let lastVideoTime = -1;
+      let poseResults = null;
+      let lastInferTime = 0;
+      const TARGET_FPS = 18;
+      const MIN_INFER_INTERVAL = 1000 / TARGET_FPS;
+
+      async function initPose() {
+        const vision = await FilesetResolver.forVisionTasks(
+          "./vendor/mediapipe/wasm"
+        );
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "./vendor/mediapipe/pose_landmarker_lite.task",
+          },
+          runningMode: "VIDEO",
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.5,
+          minPosePresenceConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+        });
+      }
+
+      let statusEl = null;
+
+      function setStatus(text, ok = true) {
+        if (!statusEl) return;
+        statusEl.textContent = text;
+        statusEl.style.color = ok ? "#065f46" : "#991b1b";
+      }
+
+      function createVideoUi() {
+        const ui = document.createElement("div");
+        ui.style.position = "fixed";
+        ui.style.right = "12px";
+        ui.style.bottom = "12px";
+        ui.style.background = "rgba(255,255,255,0.85)";
+        ui.style.border = "1px solid rgba(0,0,0,0.1)";
+        ui.style.borderRadius = "10px";
+        ui.style.padding = "10px 12px";
+        ui.style.fontSize = "13px";
+        ui.style.lineHeight = "1.35";
+        ui.style.backdropFilter = "blur(6px)";
+
+        const label = document.createElement("div");
+        label.textContent = "Motion from video:";
+        label.style.marginBottom = "6px";
+        ui.appendChild(label);
+
+        const preview = document.createElement("video");
+        preview.setAttribute("playsinline", "");
+        preview.muted = true;
+        preview.autoplay = true;
+        preview.style.width = "220px";
+        preview.style.height = "124px";
+        preview.style.objectFit = "cover";
+        preview.style.borderRadius = "8px";
+        preview.style.display = "block";
+        preview.style.marginBottom = "6px";
+        preview.style.background = "#111827";
+        ui.appendChild(preview);
+
+        statusEl = document.createElement("div");
+        statusEl.style.margin = "6px 0 8px";
+        statusEl.style.fontSize = "12px";
+        statusEl.style.opacity = "0.85";
+        statusEl.textContent = "Status: idle";
+        ui.appendChild(statusEl);
+
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "video/*";
+        input.addEventListener("change", async () => {
+          const file = input.files && input.files[0];
+          if (!file) return;
+          if (webcamStream) {
+            webcamStream.getTracks().forEach((t) => t.stop());
+            webcamStream = null;
+          }
+          const url = URL.createObjectURL(file);
+          video.src = url;
+          preview.srcObject = null;
+          preview.src = url;
+          setStatus("Video loaded");
+          await video.play();
+        });
+        ui.appendChild(input);
+
+        const webcamBtn = document.createElement("button");
+        webcamBtn.textContent = "Use Webcam";
+        webcamBtn.style.display = "block";
+        webcamBtn.style.marginTop = "8px";
+        webcamBtn.addEventListener("click", async () => {
+          if (webcamStream) {
+            webcamStream.getTracks().forEach((t) => t.stop());
+            webcamStream = null;
+            video.pause();
+            video.srcObject = null;
+            preview.pause();
+            preview.srcObject = null;
+            preview.src = "";
+            webcamBtn.textContent = "Use Webcam";
+            setStatus("Webcam stopped");
+            return;
+          }
+          webcamStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 640, height: 360 },
+            audio: false,
+          });
+          video.srcObject = webcamStream;
+          preview.srcObject = webcamStream;
+          await video.play();
+          webcamBtn.textContent = "Stop Webcam";
+          setStatus("Webcam running");
+        });
+        ui.appendChild(webcamBtn);
+
+        const animLabel = document.createElement("div");
+        animLabel.textContent = "Animation (.vrma / .glb / .gltf):";
+        animLabel.style.marginTop = "10px";
+        animLabel.style.marginBottom = "6px";
+        ui.appendChild(animLabel);
+
+        const animInput = document.createElement("input");
+        animInput.type = "file";
+        animInput.accept = ".vrma,.glb,.gltf";
+        animInput.addEventListener("change", async () => {
+          const file = animInput.files && animInput.files[0];
+          if (!file) return;
+          const url = URL.createObjectURL(file);
+          try {
+            await loadVrmAnimation(url);
+          } finally {
+            URL.revokeObjectURL(url);
+          }
+        });
+        ui.appendChild(animInput);
+
+        const hint = document.createElement("div");
+        hint.textContent = "Tip: use a clear, front-facing full-body video.";
+        hint.style.marginTop = "6px";
+        hint.style.opacity = "0.7";
+        ui.appendChild(hint);
+
+        document.body.appendChild(ui);
+      }
+
+      createVideoUi();
+      await initPose();
+
+      const gui = new GUI({ title: "VRM Controls" });
+
+      function syncRotation() {
+        if (!currentVrm) return;
+        currentVrm.scene.rotation.set(
+          THREE.MathUtils.degToRad(state.rotateX),
+          THREE.MathUtils.degToRad(state.rotateY),
+          THREE.MathUtils.degToRad(state.rotateZ)
+        );
+      }
+
+      function syncLookAt() {
+        if (!currentVrm || !currentVrm.lookAt) return;
+        currentVrm.lookAt.autoUpdate = state.lookAtCamera;
+        currentVrm.lookAt.target = state.lookAtCamera ? camera : null;
+      }
+
+      function resetExpressions() {
+        if (!currentVrm || !currentVrm.expressionManager) return;
+        const em = currentVrm.expressionManager;
+        for (const key of EXPRESSION_KEYS) {
+          setExpressionValue(em, key, 0);
+        }
+      }
+
+      function syncExpressions() {
+        if (!currentVrm || !currentVrm.expressionManager) return;
+        const em = currentVrm.expressionManager;
+        for (const key of EXPRESSION_KEYS) {
+          setExpressionValue(em, key, state[key] ?? 0);
+        }
+      }
+
+      function updateAutoBlink(t, dt) {
+        if (!state.autoBlink) return 0;
+        if (t >= nextBlinkTime) {
+          blinkPhase = 1;
+          const interval = 1 / Math.max(state.blinkRate, 0.01);
+          nextBlinkTime = t + interval * (0.8 + Math.random() * 0.4);
+        }
+        if (blinkPhase > 0) {
+          blinkPhase -= dt * state.blinkSpeed;
+          const p = 1 - Math.max(0, blinkPhase);
+          const v = p < 0.5 ? p * 2 : (1 - p) * 2;
+          return THREE.MathUtils.clamp(v, 0, 1);
+        }
+        return 0;
+      }
+
+      function updateGazeShift(t, dt) {
+        if (!state.gazeShift) return 0;
+        if (t >= nextGazeTime) {
+          const interval = 1 / Math.max(state.gazeShiftRate, 0.01);
+          nextGazeTime = t + interval * (0.8 + Math.random() * 0.6);
+          gazeTarget = Math.random() < 0.55 ? 0 : (Math.random() * 2 - 1);
+        }
+        const smooth = 1 - Math.exp(-dt * 3.5);
+        gazeCurrent += (gazeTarget - gazeCurrent) * smooth;
+        return gazeCurrent;
+      }
+
+      const tmpVecA = new THREE.Vector3();
+      const tmpVecB = new THREE.Vector3();
+      const tmpQuatA = new THREE.Quaternion();
+      const headEuler = new THREE.Euler();
+      const headQuat = new THREE.Quaternion();
+
+      function applyHeadFollow() {
+        if (!state.headFollow) return;
+        const head = getBoneNode("head") || getBoneNode("neck");
+        if (!head) return;
+        const base = basePose.get(head.name) || basePose.get("head") || basePose.get("neck");
+        if (!base) return;
+
+        head.getWorldPosition(tmpVecA);
+        camera.getWorldPosition(tmpVecB);
+        const dirWorld = tmpVecB.sub(tmpVecA).normalize();
+
+        const parent = head.parent;
+        if (!parent) return;
+        parent.getWorldQuaternion(tmpQuatA);
+        const dirLocal = dirWorld.clone().applyQuaternion(tmpQuatA.invert());
+
+        const yaw = Math.atan2(dirLocal.x, dirLocal.z);
+        const pitch = Math.atan2(-dirLocal.y, Math.sqrt(dirLocal.x * dirLocal.x + dirLocal.z * dirLocal.z));
+
+        const maxYaw = THREE.MathUtils.degToRad(state.headFollowMaxYaw);
+        const maxPitch = THREE.MathUtils.degToRad(state.headFollowMaxPitch);
+        const clampedYaw = THREE.MathUtils.clamp(yaw, -maxYaw, maxYaw);
+        const clampedPitch = THREE.MathUtils.clamp(pitch, -maxPitch, maxPitch);
+
+        headEuler.set(clampedPitch, clampedYaw, 0, "YXZ");
+        headQuat.setFromEuler(headEuler);
+        const target = base.quat.clone().multiply(headQuat);
+        head.quaternion.slerp(target, state.headFollowStrength);
+      }
+
+      gui.add(state, "rotateX", -45, 45, 1).onChange(syncRotation);
+      gui.add(state, "rotateY", -180, 180, 1).onChange(syncRotation);
+      gui.add(state, "rotateZ", -45, 45, 1).onChange(syncRotation);
+      gui.add(state, "lookAtCamera").onChange(syncLookAt);
+      const faceFolder = gui.addFolder("Face");
+      faceFolder.add(state, "blink", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "blinkLeft", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "blinkRight", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "joy", 0, 1, 0.01).name("happy (joy)").onChange(syncExpressions);
+      faceFolder.add(state, "angry", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "sorrow", 0, 1, 0.01).name("sad (sorrow)").onChange(syncExpressions);
+      faceFolder.add(state, "fun", 0, 1, 0.01).name("relaxed (fun)").onChange(syncExpressions);
+      faceFolder.add(state, "lookUp", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "lookDown", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "lookLeft", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "lookRight", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "autoBlink");
+      faceFolder.add(state, "blinkRate", 0.05, 0.5, 0.01);
+      faceFolder.add(state, "blinkSpeed", 4, 24, 1);
+      faceFolder.add(state, "gazeShift");
+      faceFolder.add(state, "gazeShiftRate", 0.02, 0.3, 0.01);
+      faceFolder.add(state, "gazeShiftAmount", 0, 1, 0.01);
+      faceFolder.add(state, "headFollow");
+      faceFolder.add(state, "headFollowStrength", 0, 1, 0.01);
+      faceFolder.add(state, "headFollowMaxYaw", 0, 60, 1);
+      faceFolder.add(state, "headFollowMaxPitch", 0, 45, 1);
+      faceFolder.add(state, "aa", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "ih", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "ou", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "ee", 0, 1, 0.01).onChange(syncExpressions);
+      faceFolder.add(state, "oh", 0, 1, 0.01).onChange(syncExpressions);
+
+      const speechFolder = gui.addFolder("Speech");
+      speechFolder.add(state, "speakingEnabled");
+      speechFolder.add(state, "speakingRate", 0.3, 3, 0.01);
+      speechFolder.add(state, "speakingIntensity", 0, 1.5, 0.01);
+      speechFolder.add(state, "speakingMouthOpen", 0, 1, 0.01);
+      speechFolder.add(state, "speakingSmile", 0, 1, 0.01);
+      speechFolder.add(state, "speakingArmGesture", 0, 1.5, 0.01);
+      speechFolder.add(state, "speakingArmSpeed", 0.3, 3, 0.01);
+      const trackingEnabledController = gui.add(state, "trackingEnabled");
+      gui.add(state, "trackingStrength", 0, 1, 0.01);
+      gui.add(state, "poseSmoothing", 0, 0.9, 0.01);
+      gui.add(state, "mirrorVideo");
+      gui.add(state, "animationEnabled");
+      gui.add(state, "animationSpeed", 0, 2, 0.01);
+      gui.add(state, "retargetMixamo");
+      gui.add(state, "retargetTranslationScale", 0, 1, 0.001);
+      gui.add(state, "retargetHipsOnlyPosition");
+      gui.add(state, "retargetUseSourceRest");
+      gui.add(state, "proceduralEnabled").onChange((value) => {
+        if (value) {
+          trackingEnabledController.setValue(false);
+          state.animationEnabled = false;
+          setStatus("Procedural idle on");
+        } else if (!state.hipSwayEnabled) {
+          restoreBasePose();
+          setStatus("Procedural idle off");
+        } else {
+          setStatus("Hip sway mode on");
+        }
+      });
+      gui.add(state, "hipSwayEnabled").onChange((value) => {
+        if (value) {
+          trackingEnabledController.setValue(false);
+          state.animationEnabled = false;
+          setStatus("Hip sway mode on");
+        } else if (!state.proceduralEnabled) {
+          restoreBasePose();
+          setStatus("Hip sway mode off");
+        } else {
+          setStatus("Procedural idle on");
+        }
+      });
+      gui.add(state, "proceduralIntensity", 0, 1.5, 0.01);
+      gui.add(state, "proceduralSpeed", 0.2, 2, 0.01);
+      gui.add(state, "proceduralArmRelax", 0, 1.2, 0.01);
+      gui.add(state, "proceduralArmForward", -0.5, 0.5, 0.01);
+      gui.add(state, "proceduralArmDown", 0, 1.5, 0.01);
+      gui.add(state, "proceduralElbowBend", 0, 1.2, 0.01);
+      gui.add(state, "proceduralBurstRate", 0.1, 2.5, 0.01);
+      gui.add(state, "proceduralIdleBias", 0, 1, 0.01);
+      gui.add(state, "proceduralFootLock");
+      gui.add(state, "springEnabled");
+      gui.add(state, "springStiffness", 1, 40, 0.1);
+      gui.add(state, "springDamping", 0.5, 20, 0.1);
+      gui.add(state, "proceduralHeadTilt", 0, 2, 0.01);
+      gui.add(state, "proceduralWeightShift", 0, 2, 0.01);
+      gui.add(state, "hipSwayIntensity", 0, 1.5, 0.01);
+      gui.add(state, "hipSwaySpeed", 0.2, 2.5, 0.01);
+
+      async function loadVrmAnimation(url) {
+        const gltf = await loader.loadAsync(url);
+        const vrmAnimations = gltf.userData.vrmAnimations;
+        if (!vrmAnimations || vrmAnimations.length === 0) {
+          if (gltf.animations && gltf.animations.length > 0) {
+            applyGltfAnimation(gltf.animations[0], gltf.scene);
+            trackingEnabledController.setValue(false);
+            state.animationEnabled = true;
+            return;
+          }
+          console.warn("No VRM or glTF animation found in file.");
+          setStatus("Animation load failed (no animation found)", false);
+          return;
+        }
+        pendingVrmAnimation = vrmAnimations[0];
+        applyVrmAnimation(pendingVrmAnimation);
+        trackingEnabledController.setValue(false);
+        state.animationEnabled = true;
+        setStatus("Animation loaded");
+      }
+
+      function applyVrmAnimation(vrmAnimation) {
+        if (!currentVrm || !vrmAnimation) return;
+        if (currentMixer) {
+          currentMixer.stopAllAction();
+          currentMixer = null;
+        }
+        const clip = createVRMAnimationClip(vrmAnimation, currentVrm);
+        currentMixer = new THREE.AnimationMixer(currentVrm.scene);
+        currentAction = currentMixer.clipAction(clip);
+        currentAction.setLoop(THREE.LoopRepeat, Infinity);
+        currentAction.enabled = true;
+        currentAction.setEffectiveWeight(1);
+        currentAction.reset().play();
+      }
+
+      const MIXAMO_TO_VRM = {
+        mixamorigHips: "hips",
+        mixamorigSpine: "spine",
+        mixamorigSpine1: "chest",
+        mixamorigSpine2: "upperChest",
+        mixamorigNeck: "neck",
+        mixamorigHead: "head",
+        mixamorigLeftShoulder: "leftShoulder",
+        mixamorigLeftArm: "leftUpperArm",
+        mixamorigLeftForeArm: "leftLowerArm",
+        mixamorigLeftHand: "leftHand",
+        mixamorigLeftHandThumb1: "leftThumbProximal",
+        mixamorigLeftHandThumb2: "leftThumbIntermediate",
+        mixamorigLeftHandThumb3: "leftThumbDistal",
+        mixamorigLeftHandIndex1: "leftIndexProximal",
+        mixamorigLeftHandIndex2: "leftIndexIntermediate",
+        mixamorigLeftHandIndex3: "leftIndexDistal",
+        mixamorigLeftHandMiddle1: "leftMiddleProximal",
+        mixamorigLeftHandMiddle2: "leftMiddleIntermediate",
+        mixamorigLeftHandMiddle3: "leftMiddleDistal",
+        mixamorigLeftHandRing1: "leftRingProximal",
+        mixamorigLeftHandRing2: "leftRingIntermediate",
+        mixamorigLeftHandRing3: "leftRingDistal",
+        mixamorigLeftHandPinky1: "leftLittleProximal",
+        mixamorigLeftHandPinky2: "leftLittleIntermediate",
+        mixamorigLeftHandPinky3: "leftLittleDistal",
+        mixamorigRightShoulder: "rightShoulder",
+        mixamorigRightArm: "rightUpperArm",
+        mixamorigRightForeArm: "rightLowerArm",
+        mixamorigRightHand: "rightHand",
+        mixamorigRightHandPinky1: "rightLittleProximal",
+        mixamorigRightHandPinky2: "rightLittleIntermediate",
+        mixamorigRightHandPinky3: "rightLittleDistal",
+        mixamorigRightHandRing1: "rightRingProximal",
+        mixamorigRightHandRing2: "rightRingIntermediate",
+        mixamorigRightHandRing3: "rightRingDistal",
+        mixamorigRightHandMiddle1: "rightMiddleProximal",
+        mixamorigRightHandMiddle2: "rightMiddleIntermediate",
+        mixamorigRightHandMiddle3: "rightMiddleDistal",
+        mixamorigRightHandIndex1: "rightIndexProximal",
+        mixamorigRightHandIndex2: "rightIndexIntermediate",
+        mixamorigRightHandIndex3: "rightIndexDistal",
+        mixamorigRightHandThumb1: "rightThumbProximal",
+        mixamorigRightHandThumb2: "rightThumbIntermediate",
+        mixamorigRightHandThumb3: "rightThumbDistal",
+        mixamorigLeftUpLeg: "leftUpperLeg",
+        mixamorigLeftLeg: "leftLowerLeg",
+        mixamorigLeftFoot: "leftFoot",
+        mixamorigLeftToeBase: "leftToes",
+        mixamorigRightUpLeg: "rightUpperLeg",
+        mixamorigRightLeg: "rightLowerLeg",
+        mixamorigRightFoot: "rightFoot",
+        mixamorigRightToeBase: "rightToes",
+      };
+
+      function normalizeMixamoRigName(name) {
+        const base = name.split("|").pop();
+        return base.replace(/^mixamorig[:_]?/i, "mixamorig");
+      }
+
+      function resolveVrmBoneName(rawName) {
+        const base = rawName.split("|").pop();
+        const normalized = normalizeMixamoRigName(base);
+        if (MIXAMO_TO_VRM[normalized]) return MIXAMO_TO_VRM[normalized];
+        if (MIXAMO_TO_VRM["mixamorig" + base]) return MIXAMO_TO_VRM["mixamorig" + base];
+        if (MIXAMO_TO_VRM["mixamorig" + normalized]) return MIXAMO_TO_VRM["mixamorig" + normalized];
+        if (MIXAMO_TO_VRM[base]) return MIXAMO_TO_VRM[base];
+        if (MIXAMO_TO_VRM["mixamorig" + base]) return MIXAMO_TO_VRM["mixamorig" + base];
+        return null;
+      }
+
+      function findSourceNode(sourceRoot, rawName) {
+        if (!sourceRoot) return null;
+        const base = rawName.split("|").pop();
+        return (
+          sourceRoot.getObjectByName(base) ||
+          sourceRoot.getObjectByName(normalizeMixamoRigName(base)) ||
+          sourceRoot.getObjectByName(base.replace(/^mixamorig[:_]?/i, "")) ||
+          null
+        );
+      }
+
+      function buildMixamoRetargetClip(clip, sourceRoot) {
+        if (!currentVrm || !currentVrm.humanoid) return clip;
+
+        const stats = { total: 0, matched: 0, skippedPosition: 0 };
+        const tracks = [];
+        for (const track of clip.tracks) {
+          const dot = track.name.lastIndexOf(".");
+          if (dot <= 0) continue;
+          const prop = track.name.slice(dot + 1);
+          if (prop !== "quaternion" && prop !== "position") continue;
+          stats.total += 1;
+
+          const vrmBoneName = resolveVrmBoneName(track.name.slice(0, dot));
+          if (!vrmBoneName) continue;
+          const node = getBoneNode(vrmBoneName);
+          if (!node) continue;
+
+          const sourceNode = findSourceNode(sourceRoot, track.name.slice(0, dot));
+          const newName = `${node.name}.${prop}`;
+          if (track instanceof THREE.QuaternionKeyframeTrack) {
+            const values = new Float32Array(track.values.length);
+            const sRest = sourceNode?.quaternion?.clone() || new THREE.Quaternion();
+            const sRestInv = sRest.clone().invert();
+            const tRest = node.quaternion.clone();
+            for (let i = 0; i < track.values.length; i += 4) {
+              const q = new THREE.Quaternion(
+                track.values[i],
+                track.values[i + 1],
+                track.values[i + 2],
+                track.values[i + 3]
+              );
+              if (currentVrm?.meta?.metaVersion === "0") {
+                q.x *= -1;
+                q.z *= -1;
+              }
+              const converted = state.retargetUseSourceRest
+                ? tRest.clone().multiply(sRestInv).multiply(q)
+                : q;
+              values[i] = converted.x;
+              values[i + 1] = converted.y;
+              values[i + 2] = converted.z;
+              values[i + 3] = converted.w;
+            }
+            tracks.push(new THREE.QuaternionKeyframeTrack(newName, track.times, values));
+          } else if (track instanceof THREE.VectorKeyframeTrack) {
+            if (state.retargetHipsOnlyPosition && vrmBoneName !== "hips") {
+              stats.skippedPosition += 1;
+              continue;
+            }
+            const values = new Float32Array(track.values.length);
+            const sRestPos = sourceNode?.position?.clone() || new THREE.Vector3();
+            const tRestPos = node.position.clone();
+            for (let i = 0; i < track.values.length; i += 3) {
+              let x = track.values[i];
+              let y = track.values[i + 1];
+              let z = track.values[i + 2];
+              if (currentVrm?.meta?.metaVersion === "0") {
+                x *= -1;
+                z *= -1;
+              }
+              if (state.retargetUseSourceRest) {
+                x = (x - sRestPos.x) * state.retargetTranslationScale + tRestPos.x;
+                y = (y - sRestPos.y) * state.retargetTranslationScale + tRestPos.y;
+                z = (z - sRestPos.z) * state.retargetTranslationScale + tRestPos.z;
+              } else {
+                x = x * state.retargetTranslationScale;
+                y = y * state.retargetTranslationScale;
+                z = z * state.retargetTranslationScale;
+              }
+              values[i] = x;
+              values[i + 1] = y;
+              values[i + 2] = z;
+            }
+            tracks.push(new THREE.VectorKeyframeTrack(newName, track.times, values));
+          }
+          stats.matched += 1;
+        }
+
+        lastRetargetStats = stats;
+        if (tracks.length === 0) return null;
+        return new THREE.AnimationClip(
+          clip.name + "_retargeted",
+          clip.duration,
+          tracks
+        );
+      }
+
+      function applyGltfAnimation(clip, sourceRoot) {
+        if (!currentVrm || !clip) return;
+        if (currentMixer) {
+          currentMixer.stopAllAction();
+          currentMixer = null;
+        }
+        let finalClip = clip;
+        if (state.retargetMixamo) {
+          finalClip = buildMixamoRetargetClip(clip, sourceRoot);
+          if (!finalClip) {
+            setStatus("Retarget failed (no tracks matched)", false);
+            // Fallback: try original clip in case it already matches the VRM rig.
+            finalClip = clip;
+          } else if (lastRetargetStats) {
+            setStatus(
+              `Retargeted: ${lastRetargetStats.matched}/${lastRetargetStats.total} tracks`
+            );
+          }
+        }
+        currentMixer = new THREE.AnimationMixer(currentVrm.scene);
+        currentAction = currentMixer.clipAction(finalClip);
+        currentAction.setLoop(THREE.LoopRepeat, Infinity);
+        currentAction.enabled = true;
+        currentAction.setEffectiveWeight(1);
+        currentAction.reset().play();
+      }
+
+      function onResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+      window.addEventListener("resize", onResize);
+
+      function landmarkToVec3(lm) {
+        const x = (lm.x - 0.5) * (state.mirrorVideo ? -2 : 2);
+        const y = (0.5 - lm.y) * 2;
+        const z = -lm.z * 2;
+        return new THREE.Vector3(x, y, z);
+      }
+
+      function getBoneNode(name) {
+        if (!currentVrm || !currentVrm.humanoid) return null;
+        return (
+          currentVrm.humanoid.getBoneNode?.(name) ||
+          currentVrm.humanoid.getNormalizedBoneNode?.(name) ||
+          null
+        );
+      }
+
+
+      function captureBasePose() {
+        basePose.clear();
+        for (const name of PROCEDURAL_BONES) {
+          const node = getBoneNode(name);
+          if (!node) continue;
+          basePose.set(name, {
+            quat: node.quaternion.clone(),
+            pos: node.position.clone(),
+          });
+        }
+        proceduralIdle.syncBasePose();
+        proceduralSpeaking.syncBasePose();
+        proceduralHipSway.syncBasePose();
+      }
+
+      function restoreBasePose() {
+        for (const [name, base] of basePose) {
+          const node = getBoneNode(name);
+          if (!node) continue;
+          node.quaternion.copy(base.quat);
+          node.position.copy(base.pos);
+        }
+        proceduralIdle.syncBasePose();
+        proceduralSpeaking.syncBasePose();
+        proceduralHipSway.syncBasePose();
+      }
+
+      function applyBoneRotation(boneName, from, to) {
+        const bone = getBoneNode(boneName);
+        if (!bone) return;
+        const quat = new THREE.Quaternion().setFromUnitVectors(
+          from.clone().normalize(),
+          to.clone().normalize()
+        );
+        const alpha = state.trackingStrength * (1 - state.poseSmoothing);
+        bone.quaternion.slerp(quat, alpha);
+      }
+
+      function applyPose(results) {
+        if (!results || !results.landmarks || !results.landmarks[0]) return;
+        const lm = results.landmarks[0];
+
+        const lShoulder = landmarkToVec3(lm[11]);
+        const rShoulder = landmarkToVec3(lm[12]);
+        const lElbow = landmarkToVec3(lm[13]);
+        const rElbow = landmarkToVec3(lm[14]);
+        const lWrist = landmarkToVec3(lm[15]);
+        const rWrist = landmarkToVec3(lm[16]);
+        const lHip = landmarkToVec3(lm[23]);
+        const rHip = landmarkToVec3(lm[24]);
+        const lKnee = landmarkToVec3(lm[25]);
+        const rKnee = landmarkToVec3(lm[26]);
+        const lAnkle = landmarkToVec3(lm[27]);
+        const rAnkle = landmarkToVec3(lm[28]);
+
+        const hipsCenter = lHip.clone().add(rHip).multiplyScalar(0.5);
+        const shouldersCenter = lShoulder.clone().add(rShoulder).multiplyScalar(0.5);
+
+        const spineDir = shouldersCenter.clone().sub(hipsCenter);
+        applyBoneRotation("hips", new THREE.Vector3(0, 1, 0), spineDir);
+        applyBoneRotation("spine", new THREE.Vector3(0, 1, 0), spineDir);
+        applyBoneRotation("chest", new THREE.Vector3(0, 1, 0), spineDir);
+        applyBoneRotation("neck", new THREE.Vector3(0, 1, 0), spineDir);
+
+        const lUpperArmDir = lElbow.clone().sub(lShoulder);
+        const lLowerArmDir = lWrist.clone().sub(lElbow);
+        const rUpperArmDir = rElbow.clone().sub(rShoulder);
+        const rLowerArmDir = rWrist.clone().sub(rElbow);
+
+        applyBoneRotation("leftUpperArm", new THREE.Vector3(1, 0, 0), lUpperArmDir);
+        applyBoneRotation("leftLowerArm", new THREE.Vector3(1, 0, 0), lLowerArmDir);
+        applyBoneRotation("rightUpperArm", new THREE.Vector3(-1, 0, 0), rUpperArmDir);
+        applyBoneRotation("rightLowerArm", new THREE.Vector3(-1, 0, 0), rLowerArmDir);
+
+        const lUpperLegDir = lKnee.clone().sub(lHip);
+        const lLowerLegDir = lAnkle.clone().sub(lKnee);
+        const rUpperLegDir = rKnee.clone().sub(rHip);
+        const rLowerLegDir = rAnkle.clone().sub(rKnee);
+
+        applyBoneRotation("leftUpperLeg", new THREE.Vector3(0, -1, 0), lUpperLegDir);
+        applyBoneRotation("leftLowerLeg", new THREE.Vector3(0, -1, 0), lLowerLegDir);
+        applyBoneRotation("rightUpperLeg", new THREE.Vector3(0, -1, 0), rUpperLegDir);
+        applyBoneRotation("rightLowerLeg", new THREE.Vector3(0, -1, 0), rLowerLegDir);
+      }
+
+      function animate() {
+        requestAnimationFrame(animate);
+        const delta = clock.getDelta();
+        const elapsed = clock.elapsedTime;
+
+        if (currentVrm) {
+          currentVrm.update(delta);
+        }
+
+        if (
+          state.trackingEnabled &&
+          !state.proceduralEnabled &&
+          poseLandmarker &&
+          !video.paused &&
+          !video.ended
+        ) {
+          const now = performance.now();
+          if (now - lastInferTime >= MIN_INFER_INTERVAL) {
+            lastInferTime = now;
+            if (video.currentTime !== lastVideoTime) {
+              lastVideoTime = video.currentTime;
+              videoCtx.drawImage(
+                video,
+                0,
+                0,
+                videoCanvas.width,
+                videoCanvas.height
+              );
+              poseResults = poseLandmarker.detectForVideo(videoCanvas, now);
+              applyPose(poseResults);
+            }
+          }
+        }
+
+        if (
+          !state.proceduralEnabled &&
+          !state.hipSwayEnabled &&
+          currentMixer &&
+          state.animationEnabled
+        ) {
+          currentMixer.update(delta * state.animationSpeed);
+        }
+
+        if (state.proceduralEnabled) {
+          proceduralIdle.update(elapsed, delta);
+        }
+        if (state.hipSwayEnabled) {
+          proceduralHipSway.update(elapsed, delta);
+        }
+
+        let speechExpressions = null;
+        if (state.speakingEnabled) {
+          speechExpressions = proceduralSpeaking.update(elapsed, delta);
+        }
+
+        if (currentVrm && currentVrm.expressionManager) {
+          syncExpressions();
+          const autoBlink = updateAutoBlink(elapsed, delta);
+          const gaze = updateGazeShift(elapsed, delta);
+
+          const blinkVal = Math.max(state.blink, autoBlink);
+          const leftBlink = Math.max(state.blinkLeft, blinkVal);
+          const rightBlink = Math.max(state.blinkRight, blinkVal);
+          setExpressionValue(currentVrm.expressionManager, "blink", blinkVal);
+          setExpressionValue(currentVrm.expressionManager, "blinkLeft", leftBlink);
+          setExpressionValue(currentVrm.expressionManager, "blinkRight", rightBlink);
+
+          const gazeAmount = state.gazeShiftAmount * Math.abs(gaze);
+          const lookLeft = Math.max(state.lookLeft, gaze < 0 ? gazeAmount : 0);
+          const lookRight = Math.max(state.lookRight, gaze > 0 ? gazeAmount : 0);
+          setExpressionValue(currentVrm.expressionManager, "lookLeft", lookLeft);
+          setExpressionValue(currentVrm.expressionManager, "lookRight", lookRight);
+
+          if (speechExpressions) {
+            for (const [key, value] of Object.entries(speechExpressions)) {
+              const base = state[key] ?? 0;
+              setExpressionValue(
+                currentVrm.expressionManager,
+                key,
+                Math.max(base, value)
+              );
+            }
+          }
+        }
+
+        applyHeadFollow();
+
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      animate();
+    </script>
+  </body>
+</html>
+
